@@ -23,9 +23,9 @@ import androidx.core.content.ContextCompat
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import androidx.lifecycle.lifecycleScope
 import androidx.wear.compose.material.Text
 import com.google.android.gms.location.*
-import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
 val Context.dataStore by preferencesDataStore(name = "settings")
@@ -60,15 +60,13 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         fusedClient = LocationServices.getFusedLocationProviderClient(this)
 
-        // Загружаем сохранённую единицу
-        lifecycleScopeLaunch {
+        lifecycleScope.launch {
             dataStore.data.collect { prefs ->
                 val name = prefs[KEY_UNIT] ?: SpeedUnit.KMH.name
                 unitState.value = SpeedUnit.valueOf(name)
             }
         }
 
-        // Запрос разрешения
         if (ContextCompat.checkSelfPermission(
                 this, Manifest.permission.ACCESS_FINE_LOCATION
             ) == PackageManager.PERMISSION_GRANTED
@@ -78,6 +76,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             val speed = speedState.value
             val unit = unitState.value
+            val context = LocalContext.current
 
             Box(
                 modifier = Modifier
@@ -107,8 +106,8 @@ class MainActivity : ComponentActivity() {
                                     SpeedUnit.KNOTS -> SpeedUnit.KMH
                                 }
                                 unitState.value = next
-                                lifecycleScopeLaunch {
-                                    dataStore.edit { it[KEY_UNIT] = next.name }
+                                lifecycleScope.launch {
+                                    context.dataStore.edit { it[KEY_UNIT] = next.name }
                                 }
                             }
                             .padding(8.dp)
@@ -125,7 +124,7 @@ class MainActivity : ComponentActivity() {
         try {
             fusedClient.requestLocationUpdates(request, locationCallback, Looper.getMainLooper())
         } catch (e: SecurityException) {
-            // нет разрешения — ничего не делаем
+            // нет разрешения
         }
     }
 
@@ -133,12 +132,4 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         fusedClient.removeLocationUpdates(locationCallback)
     }
-
-    private fun lifecycleScopeLaunch(block: suspend () -> Unit) {
-        androidx.lifecycle.lifecycleScope(this).launch { block() }
-    }
 }
-
-// небольшой хелпер, чтобы не тянуть импорт
-private fun androidx.lifecycle.lifecycleScope(activity: ComponentActivity) =
-    activity.lifecycle.let { androidx.lifecycle.LifecycleCoroutineScope::class }

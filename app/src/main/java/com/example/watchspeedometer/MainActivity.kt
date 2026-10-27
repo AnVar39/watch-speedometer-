@@ -2,31 +2,38 @@ package com.example.watchspeedometer
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
-import android.os.Looper
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.emptyPreferences
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
-import androidx.lifecycle.lifecycleScope
 import androidx.wear.compose.material.Text
-import com.google.android.gms.location.*
 import kotlinx.coroutines.launch
+import java.util.Locale
 
 val Context.dataStore by preferencesDataStore(name = "settings")
 
@@ -36,100 +43,142 @@ enum class SpeedUnit(val label: String, val factor: Float) {
     KNOTS("узлов", 1.94384f)
 }
 
+/** Палитра цветов цифр. Тап по цифрам — следующий цвет. */
+val DigitColors = listOf(
+    Color.White,
+    Color(0xFF00FF66), // зелёный
+    Color(0xFFFFEB3B), // жёлтый
+    Color(0xFFFF9800), // оранжевый
+    Color(0xFFFF3B30), // красный
+    Color(0xFF00E5FF), // голубой
+    Color(0xFFFF4DFF)  // розовый
+)
+
 class MainActivity : ComponentActivity() {
 
-    private val KEY_UNIT = stringPreferencesKey("speed_unit")
-    private lateinit var fusedClient: FusedLocationProviderClient
-
-    private val speedState = mutableStateOf(0f)
-    private val unitState = mutableStateOf(SpeedUnit.KMH)
-
-    private val locationCallback = object : LocationCallback() {
-        override fun onLocationResult(result: LocationResult) {
-            val s = result.lastLocation?.speed ?: 0f
-            speedState.value = if (s >= 0f) s else 0f
-        }
-    }
+    private val keyUnit = stringPreferencesKey("speed_unit")
+    private val keyColor = intPreferencesKey("digit_color")
 
     private val permissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) startGps()
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+            if (result[Manifest.permission.ACCESS_FINE_LOCATION] == true) startSpeedService()
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        fusedClient = LocationServices.getFusedLocationProviderClient(this)
 
-        lifecycleScope.launch {
-            dataStore.data.collect { prefs ->
-                val name = prefs[KEY_UNIT] ?: SpeedUnit.KMH.name
-                unitState.value = SpeedUnit.valueOf(name)
-            }
-        }
+        // экран не гаснет и скринсейвер не включается, пока приложение открыто
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        if (ContextCompat.checkSelfPermission(
-                this, Manifest.permission.ACCESS_FINE_LOCATION
-            ) == PackageManager.PERMISSION_GRANTED
-        ) startGps()
-        else permissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+        if (hasLocationPermission()) startSpeedService() else requestPermissions()
 
         setContent {
-            val speed = speedState.value
-            val unit = unitState.value
             val context = LocalContext.current
+            val scope = rememberCoroutineScope()
+            val prefs by context.dataStore.data.collectAsState(initial = emptyPreferences())
 
-            Box(
+            val unit = SpeedUnit.values().firstOrNull { it.name == prefs[keyUnit] } ?: SpeedUnit.KMH
+            val colorIndex = (prefs[keyColor] ?: 0).coerceIn(0, DigitColors.lastIndex)
+            val digitColor = DigitColors[colorIndex]
+
+            val speed by SpeedState.speed.collectAsState()
+            val value = speed * unit.factor
+            val text = if (unit == SpeedUnit.KNOTS)
+                String.format(Locale.US, "%.1f", value)
+            else
+                String.format(Locale.US, "%.0f", value)
+
+            Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.Black),
-                contentAlignment = Alignment.Center
+                    .background(Color.Black)
+                    .padding(bottom = 8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(
-                        text = if (unit == SpeedUnit.KNOTS)
-                            "%.1f".format(speed * unit.factor)
-                        else "%.0f".format(speed * unit.factor),
-                        fontSize = 64.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = unit.label,
-                        fontSize = 16.sp,
-                        color = Color.LightGray,
-                        modifier = Modifier
-                            .clickable {
-                                val next = when (unit) {
-                                    SpeedUnit.KMH -> SpeedUnit.MPH
-                                    SpeedUnit.MPH -> SpeedUnit.KNOTS
-                                    SpeedUnit.KNOTS -> SpeedUnit.KMH
-                                }
-                                unitState.value = next
-                                lifecycleScope.launch {
-                                    context.dataStore.edit { it[KEY_UNIT] = next.name }
+                Box(modifier = Modifier.weight(1f)) {
+                    BigSpeed(
+                        text = text,
+                        color = digitColor,
+                        onTap = {
+                            scope.launch {
+                                context.dataStore.edit {
+                                    it[keyColor] = (colorIndex + 1) % DigitColors.size
                                 }
                             }
-                            .padding(8.dp)
+                        },
+                        onLongPress = { stopAndExit() }
                     )
                 }
+                Text(
+                    text = unit.label,
+                    fontSize = 18.sp,
+                    color = Color.LightGray,
+                    modifier = Modifier
+                        .clickable {
+                            val next = SpeedUnit.values()[(unit.ordinal + 1) % SpeedUnit.values().size]
+                            scope.launch { context.dataStore.edit { it[keyUnit] = next.name } }
+                        }
+                        .padding(horizontal = 16.dp, vertical = 4.dp)
+                )
             }
         }
     }
 
-    private fun startGps() {
-        val request = LocationRequest.Builder(
-            Priority.PRIORITY_BALANCED_POWER_ACCURACY, 2000L
-        ).build()
-        try {
-            fusedClient.requestLocationUpdates(request, locationCallback, Looper.getMainLooper())
-        } catch (e: SecurityException) {
-            // нет разрешения
-        }
+    /** Долгое нажатие на цифры (или кнопка «Стоп» в уведомлении) — полный выход. */
+    private fun stopAndExit() {
+        stopService(Intent(this, SpeedService::class.java))
+        finishAndRemoveTask()
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        fusedClient.removeLocationUpdates(locationCallback)
+    private fun hasLocationPermission() =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+
+    private fun requestPermissions() {
+        val perms = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        if (Build.VERSION.SDK_INT >= 33) perms += Manifest.permission.POST_NOTIFICATIONS
+        permissionLauncher.launch(perms.toTypedArray())
+    }
+
+    private fun startSpeedService() {
+        ContextCompat.startForegroundService(this, Intent(this, SpeedService::class.java))
+    }
+}
+
+/** Цифры максимального размера: подгоняются под высоту и ширину экрана. */
+@Composable
+fun BigSpeed(
+    text: String,
+    color: Color,
+    onTap: () -> Unit,
+    onLongPress: () -> Unit
+) {
+    val tap by rememberUpdatedState(onTap)
+    val long by rememberUpdatedState(onLongPress)
+
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxSize()
+            .pointerInput(Unit) {
+                detectTapGestures(onTap = { tap() }, onLongPress = { long() })
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        val startSize = with(LocalDensity.current) { (maxHeight * 0.85f).toSp() }
+        var size by remember(text.length, startSize) { mutableStateOf(startSize) }
+
+        Text(
+            text = text,
+            fontSize = size,
+            fontWeight = FontWeight.Bold,
+            color = color,
+            textAlign = TextAlign.Center,
+            maxLines = 1,
+            softWrap = false,
+            modifier = Modifier.padding(horizontal = 6.dp),
+            onTextLayout = { layout ->
+                if (layout.didOverflowWidth && size.value > 12f) size = size * 0.92f
+            }
+        )
     }
 }

@@ -7,9 +7,14 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
+import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
@@ -19,9 +24,9 @@ import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import kotlinx.coroutines.flow.MutableStateFlow
 
-/** Текущая скорость (м/с), которую сервис отдаёт экрану. */
+/** Скорость в м/с. null — нет сигнала GPS. */
 object SpeedState {
-    val speed = MutableStateFlow(0f)
+    val speed = MutableStateFlow<Float?>(null)
 }
 
 /**
@@ -34,23 +39,52 @@ class SpeedService : Service() {
         const val ACTION_STOP = "com.example.watchspeedometer.STOP"
         private const val CHANNEL_ID = "speedometer"
         private const val NOTIF_ID = 1
+
+        /** Ниже этой скорости (м/с) показываем 0. 0.1 м/с ≈ 0.2 узла. */
+        private const val MIN_SPEED = 0.1f
+
+        /** Сглаживание: 1 = без сглаживания, меньше = плавнее. */
+        private const val SMOOTHING = 0.5f
+
+        /** Если фиксов нет дольше этого времени — показываем «--». */
+        private const val SIGNAL_TIMEOUT_MS = 5000L
     }
 
-    private lateinit var client: FusedLocationProviderClient
+    private lateinit var locationManager: LocationManager
+    private lateinit var fusedClient: FusedLocationProviderClient
+    private val handler = Handler(Looper.getMainLooper())
     private var wakeLock: PowerManager.WakeLock? = null
 
-    private val callback = object : LocationCallback() {
+    private var lastLoc: Location? = null
+    private var lastFixAt = 0L
+    private var smoothed = 0f
+
+    /** Прямой GPS-приёмник (доплеровская скорость, без фильтров fused). */
+    private val gpsListener = LocationListener { location -> handleLocation(location) }
+
+    /** Запасной вариант, если у часов нет GPS-провайдера. */
+    private val fusedCallback = object : LocationCallback() {
         override fun onLocationResult(result: LocationResult) {
-            val loc = result.lastLocation ?: return
-            val s = if (loc.hasSpeed() && loc.speed >= 0f) loc.speed else 0f
-            // шум GPS на стоянке (< ~1.8 км/ч) считаем нулём
-            SpeedState.speed.value = if (s < 0.5f) 0f else s
+            result.lastLocation?.let { handleLocation(it) }
+        }
+    }
+
+    /** Если сигнал пропал — не держим старую скорость, показываем «--». */
+    private val watchdog = object : Runnable {
+        override fun run() {
+            if (SystemClock.elapsedRealtime() - lastFixAt > SIGNAL_TIMEOUT_MS) {
+                SpeedState.speed.value = null
+                smoothed = 0f
+                lastLoc = null
+            }
+            handler.postDelayed(this, 1000L)
         }
     }
 
     override fun onCreate() {
         super.onCreate()
-        client = LocationServices.getFusedLocationProviderClient(this)
+        locationManager = getSystemService(LOCATION_SERVICE) as LocationManager
+        fusedClient = LocationServices.getFusedLocationProviderClient(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -76,21 +110,64 @@ class SpeedService : Service() {
             }
         }
 
+        lastFixAt = SystemClock.elapsedRealtime()
+        handler.removeCallbacks(watchdog)
+        handler.postDelayed(watchdog, 1000L)
+
         startGps()
         return START_STICKY
     }
 
     private fun startGps() {
-        // сначала снимаем старую подписку, чтобы не было дублей
-        client.removeLocationUpdates(callback)
-        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000L)
-            .setMinUpdateIntervalMillis(500L)
-            .build()
+        stopGps() // без дублей подписки
         try {
-            client.requestLocationUpdates(request, callback, Looper.getMainLooper())
+            if (locationManager.allProviders.contains(LocationManager.GPS_PROVIDER)) {
+                locationManager.requestLocationUpdates(
+                    LocationManager.GPS_PROVIDER, 1000L, 0f, gpsListener, Looper.getMainLooper()
+                )
+            } else {
+                val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000L)
+                    .setMinUpdateIntervalMillis(500L)
+                    .setMinUpdateDistanceMeters(0f)
+                    .setWaitForAccurateLocation(false)
+                    .build()
+                fusedClient.requestLocationUpdates(request, fusedCallback, Looper.getMainLooper())
+            }
         } catch (e: SecurityException) {
             stopSelf()
         }
+    }
+
+    private fun stopGps() {
+        try {
+            locationManager.removeUpdates(gpsListener)
+        } catch (e: SecurityException) {
+        }
+        fusedClient.removeLocationUpdates(fusedCallback)
+    }
+
+    private fun handleLocation(loc: Location) {
+        lastFixAt = SystemClock.elapsedRealtime()
+        val prev = lastLoc
+        lastLoc = loc
+
+        // 1) скорость от GPS (доплер); 2) если её нет — считаем по смещению; 3) иначе держим прежнюю
+        var s: Float = when {
+            loc.hasSpeed() -> loc.speed
+            prev != null -> {
+                val dt = (loc.elapsedRealtimeNanos - prev.elapsedRealtimeNanos) / 1e9f
+                if (dt in 0.3f..5f) prev.distanceTo(loc) / dt else smoothed
+            }
+            else -> smoothed
+        }
+        if (s.isNaN() || s < 0f) s = 0f
+        if (s < MIN_SPEED) s = 0f
+
+        val hadSignal = SpeedState.speed.value != null
+        smoothed = if (hadSignal) smoothed + SMOOTHING * (s - smoothed) else s
+        if (smoothed < MIN_SPEED) smoothed = 0f
+
+        SpeedState.speed.value = smoothed
     }
 
     private fun buildNotification(): Notification {
@@ -121,9 +198,10 @@ class SpeedService : Service() {
     }
 
     override fun onDestroy() {
-        client.removeLocationUpdates(callback)
+        handler.removeCallbacks(watchdog)
+        stopGps()
         wakeLock?.let { if (it.isHeld) it.release() }
-        SpeedState.speed.value = 0f
+        SpeedState.speed.value = null
         super.onDestroy()
     }
 

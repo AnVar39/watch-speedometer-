@@ -10,6 +10,7 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -17,7 +18,9 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -43,7 +46,7 @@ enum class SpeedUnit(val label: String, val factor: Float) {
     KNOTS("узлов", 1.94384f)
 }
 
-/** Палитра цветов цифр. Тап по цифрам — следующий цвет. */
+/** Палитра цветов. Тап по цифрам — следующий цвет. */
 val DigitColors = listOf(
     Color.White,
     Color(0xFF00FF66), // зелёный
@@ -79,14 +82,15 @@ class MainActivity : ComponentActivity() {
 
             val unit = SpeedUnit.values().firstOrNull { it.name == prefs[keyUnit] } ?: SpeedUnit.KMH
             val colorIndex = (prefs[keyColor] ?: 0).coerceIn(0, DigitColors.lastIndex)
-            val digitColor = DigitColors[colorIndex]
+            val color = DigitColors[colorIndex]
 
             val speed by SpeedState.speed.collectAsState()
-            val value = speed * unit.factor
-            val text = if (unit == SpeedUnit.KNOTS)
-                String.format(Locale.US, "%.1f", value)
-            else
-                String.format(Locale.US, "%.0f", value)
+            val s = speed
+            val text = when {
+                s == null -> "--" // нет сигнала GPS
+                unit == SpeedUnit.KNOTS -> String.format(Locale.US, "%.1f", s * unit.factor)
+                else -> String.format(Locale.US, "%.0f", s * unit.factor)
+            }
 
             Column(
                 modifier = Modifier
@@ -95,10 +99,20 @@ class MainActivity : ComponentActivity() {
                     .padding(bottom = 8.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
+                // кораблик сверху — только в узлах
+                if (unit == SpeedUnit.KNOTS) {
+                    ShipIcon(
+                        color = color,
+                        modifier = Modifier
+                            .padding(top = 14.dp)
+                            .size(width = 40.dp, height = 28.dp)
+                    )
+                }
+
                 Box(modifier = Modifier.weight(1f)) {
                     BigSpeed(
                         text = text,
-                        color = digitColor,
+                        color = color,
                         onTap = {
                             scope.launch {
                                 context.dataStore.edit {
@@ -109,10 +123,12 @@ class MainActivity : ComponentActivity() {
                         onLongPress = { stopAndExit() }
                     )
                 }
+
+                // единицы измерения — того же цвета, что и цифры
                 Text(
                     text = unit.label,
                     fontSize = 18.sp,
-                    color = Color.LightGray,
+                    color = color,
                     modifier = Modifier
                         .clickable {
                             val next = SpeedUnit.values()[(unit.ordinal + 1) % SpeedUnit.values().size]
@@ -142,6 +158,51 @@ class MainActivity : ComponentActivity() {
 
     private fun startSpeedService() {
         ContextCompat.startForegroundService(this, Intent(this, SpeedService::class.java))
+    }
+}
+
+/** Иконка кораблика (парусник), рисуется кодом, цвет задаётся снаружи. */
+@Composable
+fun ShipIcon(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+
+        // корпус
+        val hull = Path().apply {
+            moveTo(0.05f * w, 0.70f * h)
+            lineTo(0.95f * w, 0.70f * h)
+            lineTo(0.78f * w, 0.95f * h)
+            lineTo(0.22f * w, 0.95f * h)
+            close()
+        }
+        drawPath(hull, color)
+
+        // мачта
+        drawLine(
+            color = color,
+            start = Offset(0.50f * w, 0.04f * h),
+            end = Offset(0.50f * w, 0.68f * h),
+            strokeWidth = 0.05f * w
+        )
+
+        // грот
+        val mainSail = Path().apply {
+            moveTo(0.55f * w, 0.08f * h)
+            lineTo(0.90f * w, 0.62f * h)
+            lineTo(0.55f * w, 0.62f * h)
+            close()
+        }
+        drawPath(mainSail, color)
+
+        // стаксель
+        val jib = Path().apply {
+            moveTo(0.45f * w, 0.16f * h)
+            lineTo(0.45f * w, 0.62f * h)
+            lineTo(0.16f * w, 0.62f * h)
+            close()
+        }
+        drawPath(jib, color)
     }
 }
 

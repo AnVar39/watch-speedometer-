@@ -4,9 +4,11 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.annotation.SuppressLint
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.location.GnssStatus
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -16,6 +18,7 @@ import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
@@ -27,6 +30,12 @@ import kotlinx.coroutines.flow.MutableStateFlow
 /** Скорость в м/с. null — нет сигнала GPS. */
 object SpeedState {
     val speed = MutableStateFlow<Float?>(null)
+
+    /** Подсказка под «--»: сколько спутников в решении, или «GPS выключен». */
+    val status = MutableStateFlow("")
+
+    /** true, когда пользователь нажал «Стоп» в уведомлении — экран должен закрыться. */
+    val stopRequested = MutableStateFlow(false)
 }
 
 /**
@@ -48,6 +57,10 @@ class SpeedService : Service() {
 
         /** Если фиксов нет дольше этого времени — показываем «--». */
         private const val SIGNAL_TIMEOUT_MS = 5000L
+
+        /** true, пока сервис запущен (чтобы экран не запускал его повторно). */
+        @Volatile
+        var running = false
     }
 
     private lateinit var locationManager: LocationManager
@@ -60,7 +73,23 @@ class SpeedService : Service() {
     private var smoothed = 0f
 
     /** Прямой GPS-приёмник (доплеровская скорость, без фильтров fused). */
-    private val gpsListener = LocationListener { location -> handleLocation(location) }
+    private val gpsListener = object : LocationListener {
+        override fun onLocationChanged(location: Location) = handleLocation(location)
+        override fun onProviderEnabled(provider: String) = updateStatus()
+        override fun onProviderDisabled(provider: String) = updateStatus()
+    }
+
+    private var satsUsed = 0
+
+    /** Считаем спутники, участвующие в определении позиции. */
+    private val gnssCallback = object : GnssStatus.Callback() {
+        override fun onSatelliteStatusChanged(status: GnssStatus) {
+            var used = 0
+            for (i in 0 until status.satelliteCount) if (status.usedInFix(i)) used++
+            satsUsed = used
+            updateStatus()
+        }
+    }
 
     /** Запасной вариант, если у часов нет GPS-провайдера. */
     private val fusedCallback = object : LocationCallback() {
@@ -85,10 +114,12 @@ class SpeedService : Service() {
         super.onCreate()
         locationManager = getSystemService(LOCATION_SERVICE) as LocationManager
         fusedClient = LocationServices.getFusedLocationProviderClient(this)
+        running = true
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            SpeedState.stopRequested.value = true // экран закроется сам
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
@@ -118,8 +149,16 @@ class SpeedService : Service() {
         return START_STICKY
     }
 
+    @SuppressLint("MissingPermission")
     private fun startGps() {
         stopGps() // без дублей подписки
+        updateStatus()
+        try {
+            locationManager.registerGnssStatusCallback(
+                ContextCompat.getMainExecutor(this), gnssCallback
+            )
+        } catch (e: SecurityException) {
+        }
         try {
             if (locationManager.allProviders.contains(LocationManager.GPS_PROVIDER)) {
                 locationManager.requestLocationUpdates(
@@ -141,9 +180,20 @@ class SpeedService : Service() {
     private fun stopGps() {
         try {
             locationManager.removeUpdates(gpsListener)
+            locationManager.unregisterGnssStatusCallback(gnssCallback)
         } catch (e: SecurityException) {
         }
         fusedClient.removeLocationUpdates(fusedCallback)
+    }
+
+    private fun updateStatus() {
+        val gpsOn = !locationManager.allProviders.contains(LocationManager.GPS_PROVIDER) ||
+            locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
+        SpeedState.status.value = when {
+            !gpsOn -> "GPS выключен"
+            satsUsed > 0 -> "спутников: $satsUsed"
+            else -> "поиск спутников…"
+        }
     }
 
     private fun handleLocation(loc: Location) {
@@ -202,6 +252,8 @@ class SpeedService : Service() {
         stopGps()
         wakeLock?.let { if (it.isHeld) it.release() }
         SpeedState.speed.value = null
+        SpeedState.status.value = ""
+        running = false
         super.onDestroy()
     }
 

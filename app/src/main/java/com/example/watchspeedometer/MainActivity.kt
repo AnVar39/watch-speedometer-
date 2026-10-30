@@ -29,6 +29,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.intPreferencesKey
@@ -73,6 +74,12 @@ class MainActivity : ComponentActivity() {
         // экран не гаснет и скринсейвер не включается, пока приложение открыто
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
+        // «Стоп» в уведомлении закрывает и экран
+        SpeedState.stopRequested.value = false
+        lifecycleScope.launch {
+            SpeedState.stopRequested.collect { if (it) finishAndRemoveTask() }
+        }
+
         if (hasLocationPermission()) startSpeedService() else requestPermissions()
 
         setContent {
@@ -86,6 +93,7 @@ class MainActivity : ComponentActivity() {
 
             val speed by SpeedState.speed.collectAsState()
             val s = speed
+            val status by SpeedState.status.collectAsState()
             val text = when {
                 s == null -> "--" // нет сигнала GPS
                 unit == SpeedUnit.KNOTS -> String.format(Locale.US, "%.1f", s * unit.factor)
@@ -124,6 +132,15 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
+                // пока нет сигнала — объясняем почему (спутники / GPS выключен)
+                if (s == null && status.isNotEmpty()) {
+                    Text(
+                        text = status,
+                        fontSize = 12.sp,
+                        color = Color.Gray
+                    )
+                }
+
                 // единицы измерения — того же цвета, что и цифры
                 Text(
                     text = unit.label,
@@ -157,6 +174,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startSpeedService() {
+        if (SpeedService.running) return
         ContextCompat.startForegroundService(this, Intent(this, SpeedService::class.java))
     }
 }
